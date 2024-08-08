@@ -214,6 +214,10 @@ func GetGPUInfo() GpuInfoList {
 		if err != nil {
 			slog.Warn("error looking up system memory", "error", err)
 		}
+		details, err := GetCPUDetails()
+		if err != nil {
+			slog.Warn("failed to lookup CPU details", "error", err)
+		}
 		cpus = []CPUInfo{
 			{
 				GpuInfo: GpuInfo{
@@ -222,6 +226,7 @@ func GetGPUInfo() GpuInfoList {
 					Variant: cpuCapability.String(),
 					ID:      "0",
 				},
+				CPUs: details,
 			},
 		}
 
