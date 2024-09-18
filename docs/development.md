@@ -118,37 +118,43 @@ If you have Docker available, you can build linux binaries with `./scripts/build
 
 ### Windows
 
-Note: The Windows build for Ollama is still under development.
+The following tools are required as a minimal development environment to build CPU inference support.
 
-First, install required tools:
-
-- MSVC toolchain - C/C++ and cmake as minimal requirements
 - Go version 1.22 or higher
-- MinGW (pick one variant) with GCC.
-  - [MinGW-w64](https://www.mingw-w64.org/)
+  - https://go.dev/dl/
+- Git
+  - https://git-scm.com/download/win
+- GCC and Make.  There are multiple options on how to go about installing these tools on Windows.  We have verified the following, but others may work as well:  
   - [MSYS2](https://www.msys2.org/)
-- The `ThreadJob` Powershell module: `Install-Module -Name ThreadJob -Scope CurrentUser`
+    - After installing, from an MSYS2 terminal, run `pacman -S mingw-w64-ucrt-x86_64-gcc make` to install the required tools
+    - Assuming you used the default install prefix, add `c:\msys64\ucrt64\bin` and `c:\msys64\usr\bin` to your environment variable `PATH`
 
 Then, build the `ollama` binary:
 
 ```powershell
 $env:CGO_ENABLED="1"
-go generate ./...
+make -C llama -j 8
 go build .
 ```
 
+#### GPU Support
+
+The GPU tools require the Microsoft native build tools.  To build either CUDA or ROCm, you must first install MSVC via Visual Studio:
+
+- Make sure to select `Desktop development with C++` as a Workload during the Visual Studio install
+- You must complete the Visual Studio install and run it once **BEFORE** installing CUDA or ROCm for the tools to properly register
+- Add the location of the **64 bit (x64)** compiler (`cl.exe`) to your `PATH`
+- Note: the default Developer Shell may configure the 32 bit (x86) compiler which will lead to build failures.  Ollama requires a 64 bit toolchain.
+
 #### Windows CUDA (NVIDIA)
 
-In addition to the common Windows development tools described above, install CUDA after installing MSVC.
+In addition to the common Windows development tools and MSVC described above:
 
 - [NVIDIA CUDA](https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html)
 
-
 #### Windows ROCm (AMD Radeon)
 
-In addition to the common Windows development tools described above, install AMDs HIP package after installing MSVC.
+In addition to the common Windows development tools and MSVC described above:
 
 - [AMD HIP](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html)
-- [Strawberry Perl](https://strawberryperl.com/)
 
-Lastly, add `ninja.exe` included with MSVC to the system path (e.g. `C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja`).
