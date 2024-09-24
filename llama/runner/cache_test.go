@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
@@ -8,32 +9,50 @@ import (
 func TestCountCommon(t *testing.T) {
 	tests := []struct {
 		name     string
-		t1       []int
-		t2       []int
+		t1       []input
+		t2       []input
 		expected int
 	}{
 		{
 			name:     "Equal",
-			t1:       []int{1, 2, 3},
-			t2:       []int{1, 2, 3},
+			t1:       []input{{token: 1}, {token: 2}, {token: 3}},
+			t2:       []input{{token: 1}, {token: 2}, {token: 3}},
 			expected: 3,
 		},
 		{
 			name:     "Prefix",
-			t1:       []int{1},
-			t2:       []int{1, 2, 3},
+			t1:       []input{{token: 1}},
+			t2:       []input{{token: 1}, {token: 2}, {token: 3}},
 			expected: 1,
 		},
 		{
+			name:     "Embeddings Prefix",
+			t1:       []input{{embed: []float32{0.1, 0.2, 0.3}}},
+			t2:       []input{{embed: []float32{0.1, 0.2, 0.3}}, {embed: []float32{0.4, 0.5, 0.6}}, {embed: []float32{0.7}}},
+			expected: 1,
+		},
+		{
+			name:     "Embeddings Prefix Partial",
+			t1:       []input{{embed: []float32{0.1, 0.2, 0.3}}},
+			t2:       []input{{embed: []float32{0.1, 0.2}}, {embed: []float32{0.4, 0.5, 0.6}}, {embed: []float32{0.7}}},
+			expected: 0,
+		},
+		{
+			name:     "Mixed",
+			t1:       []input{{token: 1}, {embed: []float32{0.2, 0.3, 0.4}}},
+			t2:       []input{{token: 1}, {embed: []float32{0.2, 0.3, 0.4}}, {token: 5}},
+			expected: 2,
+		},
+		{
 			name:     "Empty",
-			t1:       []int{},
-			t2:       []int{1, 2, 3},
+			t1:       []input{},
+			t2:       []input{{token: 1}, {token: 2}, {token: 3}},
 			expected: 0,
 		},
 		{
 			name:     "Both Empty",
-			t1:       []int{},
-			t2:       []int{},
+			t1:       []input{},
+			t2:       []input{},
 			expected: 0,
 		},
 	}
@@ -51,130 +70,130 @@ func TestCountCommon(t *testing.T) {
 func TestFindCacheSlot(t *testing.T) {
 	tests := []struct {
 		name        string
-		cache       TokenCache
-		prompt      []int
+		cache       InputCache
+		prompt      []input
 		expected    int
 		expectedLen int
 	}{
 		{
 			name: "Empty",
-			cache: TokenCache{slots: []TokenCacheSlot{
+			cache: InputCache{slots: []InputCacheSlot{
 				{
-					id:       0,
-					tokens:   []int{},
-					inUse:    false,
+					Id:       0,
+					Inputs:   []input{},
+					InUse:    false,
 					lastUsed: time.Time{},
 				},
 				{
-					id:       1,
-					tokens:   []int{},
-					inUse:    false,
+					Id:       1,
+					Inputs:   []input{},
+					InUse:    false,
 					lastUsed: time.Time{},
 				},
 			}},
-			prompt:      []int{1},
+			prompt:      []input{{token: 1}},
 			expected:    0,
 			expectedLen: 0,
 		},
 		{
 			name: "Extend",
-			cache: TokenCache{slots: []TokenCacheSlot{
+			cache: InputCache{slots: []InputCacheSlot{
 				{
-					id:       0,
-					tokens:   []int{1},
-					inUse:    false,
+					Id:       0,
+					Inputs:   []input{{token: 1}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-time.Second),
 				},
 				{
-					id:       1,
-					tokens:   []int{1, 2},
-					inUse:    false,
+					Id:       1,
+					Inputs:   []input{{token: 1}, {token: 2}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-2 * time.Second),
 				},
 			}},
-			prompt:      []int{1, 2},
+			prompt:      []input{{token: 1}, {token: 2}},
 			expected:    1,
 			expectedLen: 2,
 		},
 		{
 			name: "New",
-			cache: TokenCache{slots: []TokenCacheSlot{
+			cache: InputCache{slots: []InputCacheSlot{
 				{
-					id:       0,
-					tokens:   []int{1, 2},
-					inUse:    false,
+					Id:       0,
+					Inputs:   []input{{token: 1}, {token: 2}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-time.Second),
 				},
 				{
-					id:       1,
-					tokens:   []int{},
-					inUse:    false,
+					Id:       1,
+					Inputs:   []input{},
+					InUse:    false,
 					lastUsed: time.Time{},
 				},
 			}},
-			prompt:      []int{2},
+			prompt:      []input{{token: 2}},
 			expected:    1,
 			expectedLen: 0,
 		},
 		{
 			name: "Fork",
-			cache: TokenCache{
-				slots: []TokenCacheSlot{
+			cache: InputCache{
+				slots: []InputCacheSlot{
 					{
-						id:       0,
-						tokens:   []int{1, 2},
-						inUse:    false,
+						Id:       0,
+						Inputs:   []input{{token: 1}, {token: 2}},
+						InUse:    false,
 						lastUsed: time.Now().Add(-time.Second),
 					},
 					{
-						id:       1,
-						tokens:   []int{},
-						inUse:    false,
+						Id:       1,
+						Inputs:   []input{},
+						InUse:    false,
 						lastUsed: time.Time{},
 					},
 				},
 			},
-			prompt:      []int{1},
+			prompt:      []input{{token: 1}},
 			expected:    1,
 			expectedLen: 1,
 		},
 		{
 			name: "Evict",
-			cache: TokenCache{slots: []TokenCacheSlot{
+			cache: InputCache{slots: []InputCacheSlot{
 				{
-					id:       0,
-					tokens:   []int{1},
-					inUse:    false,
+					Id:       0,
+					Inputs:   []input{{token: 1}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-time.Second),
 				},
 				{
-					id:       1,
-					tokens:   []int{1, 2},
-					inUse:    false,
+					Id:       1,
+					Inputs:   []input{{token: 1}, {token: 2}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-2 * time.Second),
 				},
 			}},
-			prompt:      []int{2, 3},
+			prompt:      []input{{token: 2}, {token: 3}},
 			expected:    1,
 			expectedLen: 0,
 		},
 		{
 			name: "In use",
-			cache: TokenCache{slots: []TokenCacheSlot{
+			cache: InputCache{slots: []InputCacheSlot{
 				{
-					id:       0,
-					tokens:   []int{1},
-					inUse:    false,
+					Id:       0,
+					Inputs:   []input{{token: 1}},
+					InUse:    false,
 					lastUsed: time.Now().Add(-time.Second),
 				},
 				{
-					id:       1,
-					tokens:   []int{1, 2},
-					inUse:    true,
+					Id:       1,
+					Inputs:   []input{{token: 1}, {token: 2}},
+					InUse:    true,
 					lastUsed: time.Now().Add(-2 * time.Second),
 				},
 			}},
-			prompt:      []int{1, 2},
+			prompt:      []input{{token: 1}, {token: 2}},
 			expected:    0,
 			expectedLen: 2,
 		},
@@ -182,11 +201,87 @@ func TestFindCacheSlot(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, resultLen := tt.cache.findCacheSlot(tt.prompt)
-			if result.id != tt.expected || resultLen != tt.expectedLen {
+			result, resultLen, err := tt.cache.findCacheSlot(tt.prompt)
+			if err != nil {
+				t.Errorf("findCacheSlot: err %v", err)
+			} else if result.Id != tt.expected || resultLen != tt.expectedLen {
 				t.Errorf("findCacheSlot: slot have %v, want %v len have %v, want %v",
-					result.id, tt.expected, resultLen, tt.expectedLen)
+					result.Id, tt.expected, resultLen, tt.expectedLen)
 			}
 		})
+	}
+}
+
+func TestImageCache(t *testing.T) {
+	cache := NewInputCache(nil, 2048, 4)
+
+	valA := [][]float32{{0.1, 0.2}, {0.3}}
+	valB := [][]float32{{0.4}, {0.5}, {0.6}}
+	valC := [][]float32{{0.7}}
+	valD := [][]float32{{0.8}}
+	valE := [][]float32{{0.9}}
+
+	// Empty cache
+	result, err := cache.FindImage(0x5adb61d31933a946)
+	if err != ErrImageNotFound {
+		t.Errorf("found result in empty cache: result %v, err %v", result, err)
+	}
+
+	// Insert A
+	cache.AddImage(0x5adb61d31933a946, valA)
+
+	result, err = cache.FindImage(0x5adb61d31933a946)
+	if !reflect.DeepEqual(result, valA) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+
+	// Insert B
+	cache.AddImage(0x011551369a34a901, valB)
+
+	result, err = cache.FindImage(0x5adb61d31933a946)
+	if !reflect.DeepEqual(result, valA) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0x011551369a34a901)
+	if !reflect.DeepEqual(result, valB) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+
+	// Replace B with C
+	cache.AddImage(0x011551369a34a901, valC)
+
+	result, err = cache.FindImage(0x5adb61d31933a946)
+	if !reflect.DeepEqual(result, valA) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0x011551369a34a901)
+	if !reflect.DeepEqual(result, valC) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+
+	// Evict A
+	cache.AddImage(0x756b218a517e7353, valB)
+	cache.AddImage(0x75e5e8d35d7e3967, valD)
+	cache.AddImage(0xd96f7f268ca0646e, valE)
+
+	result, err = cache.FindImage(0x5adb61d31933a946)
+	if reflect.DeepEqual(result, valA) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0x756b218a517e7353)
+	if !reflect.DeepEqual(result, valB) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0x011551369a34a901)
+	if !reflect.DeepEqual(result, valC) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0x75e5e8d35d7e3967)
+	if !reflect.DeepEqual(result, valD) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
+	}
+	result, err = cache.FindImage(0xd96f7f268ca0646e)
+	if !reflect.DeepEqual(result, valE) {
+		t.Errorf("failed to find expected value: result %v, err %v", result, err)
 	}
 }

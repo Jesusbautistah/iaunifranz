@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -23,8 +24,17 @@ import (
 	"github.com/ollama/ollama/llama"
 )
 
+// input is an element of the prompt to process, either
+// a token or an image embedding (generated from a vision projector)
+type input struct {
+	token int
+
+	// embed is an image embedding
+	embed []float32
+}
+
 type Sequence struct {
-	// number of tokens evaluated
+	// number of inputs evaluated
 	numPast int
 
 	// batch index
@@ -33,15 +43,14 @@ type Sequence struct {
 	// number of tokens predicted so far
 	numPredicted int
 
-	// tokens left to evaluate
-	tokens []int
+	// prompt inputs left to evaluate
+	inputs []input
 
 	// tokens that have been generated but not returned yet (e.g. for stop sequences)
-	// TODO (jmorganca): simplify this
 	pendingResponses []string
 
-	// token cache being used by this sequence
-	cache *TokenCacheSlot
+	// input cache being used by this sequence
+	cache *InputCacheSlot
 
 	// channel to send responses over
 	responses chan string
@@ -60,7 +69,7 @@ type Sequence struct {
 	// stop sequences
 	stop []string
 
-	// number of tokens to keep at the beginning when shifting context window
+	// number of inputs to keep at the beginning when shifting context window
 	numKeep int
 
 	// true if an embedding are to be returned instead of text generation
@@ -72,7 +81,7 @@ type Sequence struct {
 	startProcessingTime time.Time
 	startGenerationTime time.Time
 	numDecoded          int
-	numPromptTokens     int
+	numPromptInputs     int
 }
 
 type NewSequenceParams struct {
@@ -83,20 +92,24 @@ type NewSequenceParams struct {
 	embedding      bool
 }
 
-func (s *Server) NewSequence(prompt string, params NewSequenceParams) *Sequence {
+func (s *Server) NewSequence(prompt string, images []ImageData, params NewSequenceParams) (*Sequence, error) {
 	s.ready.Wait()
 
-	tokens, err := s.lc.Model().Tokenize(prompt, true, true)
+	startTime := time.Now()
+
+	inputs, err := s.inputs(prompt, images)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("failed to process inputs: %w", err)
+	} else if len(inputs) == 0 {
+		return nil, errors.New("no input provided")
 	}
 
 	if params.numKeep < 0 {
-		params.numKeep = len(tokens)
+		params.numKeep = len(inputs)
 	}
 
 	if !params.embedding {
-		// Subtracting 4 ensures that at least 1 token can be discarded during shift
+		// Subtracting 4 ensures that at least 1 input can be discarded during shift
 		params.numKeep = min(params.numKeep, s.cache.numCtx-4)
 		params.numKeep += s.bosToken
 	} else {
@@ -105,40 +118,109 @@ func (s *Server) NewSequence(prompt string, params NewSequenceParams) *Sequence 
 	}
 
 	// truncate to fit in context window
-	if len(tokens) > s.cache.numCtx {
-		slog.Warn("truncating input prompt", "limit", s.cache.numCtx, "prompt", len(tokens), "numKeep", params.numKeep)
-		newTokens := tokens[:params.numKeep]
-		newTokens = append(newTokens, tokens[len(tokens)-s.cache.numCtx+params.numKeep:]...)
-		tokens = newTokens
+	if len(inputs) > s.cache.numCtx {
+		slog.Warn("truncating input prompt", "limit", s.cache.numCtx, "prompt", len(inputs), "numKeep", params.numKeep)
+		newInputs := inputs[:params.numKeep]
+		newInputs = append(newInputs, inputs[len(inputs)-s.cache.numCtx+params.numKeep:]...)
+		inputs = newInputs
 	}
 
 	var sc *llama.SamplingContext
 	if params.samplingParams != nil {
 		sc = llama.NewSamplingContext(*params.samplingParams)
-		for _, t := range tokens {
-			sc.Accept(s.lc, t, false)
+		for _, input := range inputs {
+			if input.embed == nil {
+				sc.Accept(s.lc, input.token, false)
+			}
 		}
 	}
 
 	return &Sequence{
-		tokens:           tokens,
-		numPromptTokens:  len(tokens),
-		numPredict:       params.numPredict,
-		pendingResponses: make([]string, 0),
-		responses:        make(chan string, 1),
-		quit:             make(chan bool, 1),
-		embedding:        make(chan []float32, 1),
-		samplingCtx:      sc,
-		embeddingOnly:    params.embedding,
-		stop:             params.stop,
-		numKeep:          params.numKeep,
+		inputs:              inputs,
+		numPromptInputs:     len(inputs),
+		startProcessingTime: startTime,
+		numPredict:          params.numPredict,
+		pendingResponses:    make([]string, 0),
+		responses:           make(chan string, 1),
+		quit:                make(chan bool, 1),
+		embedding:           make(chan []float32, 1),
+		samplingCtx:         sc,
+		embeddingOnly:       params.embedding,
+		stop:                params.stop,
+		numKeep:             params.numKeep,
+	}, nil
+}
+
+// inputs processes the prompt and images into a list of inputs
+// by splitting the prompt on [img-<n>] tags, tokenizing text and
+// generating image embeddings for each image
+func (s *Server) inputs(prompt string, images []ImageData) ([]input, error) {
+	var inputs []input
+
+	re := regexp.MustCompile(`\[img-(\d+)\]`)
+	parts := re.Split(prompt, -1)
+	matches := re.FindAllStringSubmatch(prompt, -1)
+
+	for i, part := range parts {
+		// text - tokenize
+		if strings.TrimSpace(part) != "" {
+			tokens, err := s.lc.Model().Tokenize(part, i == 0, true)
+			if err != nil {
+				return nil, err
+			}
+
+			for _, t := range tokens {
+				inputs = append(inputs, input{token: t})
+			}
+		}
+
+		// image - generate image embedding
+		if i < len(matches) {
+			n, _ := strconv.Atoi(matches[i][1])
+
+			imageIndex := -1
+			for j := range images {
+				if images[j].ID == n {
+					imageIndex = j
+					break
+				}
+			}
+
+			if imageIndex < 0 {
+				return nil, fmt.Errorf("invalid image index: %d", n)
+			}
+
+			hash := s.cache.HashImage(images[imageIndex].Data)
+
+			// Vision models cannot be accessed concurrently
+			s.clip.mu.Lock()
+			embed, err := s.cache.FindImage(hash)
+			if err != nil {
+				embed = llama.NewLlavaImageEmbed(s.lc, s.clip.cc, images[imageIndex].Data)
+				s.cache.AddImage(hash, embed)
+			}
+			s.clip.mu.Unlock()
+
+			for _, e := range embed {
+				inputs = append(inputs, input{embed: e})
+			}
+		}
 	}
+
+	return inputs, nil
+}
+
+type clip struct {
+	cc *llama.ClipContext
+	mu sync.Mutex
 }
 
 type Server struct {
 	model *llama.Model
 	lc    *llama.Context
-	cc    *llama.ClipContext
+
+	// required for image embeddings
+	clip clip
 
 	batchSize int
 
@@ -150,10 +232,13 @@ type Server struct {
 	seqs []*Sequence
 
 	// KV cache
-	cache *TokenCache
+	cache *InputCache
 
 	// does this model require a beginning of sequence token?
 	bosToken int
+
+	// next sequence for prompt processing to avoid starvation
+	nextSeq int
 
 	// is the server ready to process requests?
 	ready sync.WaitGroup
@@ -188,45 +273,17 @@ func (s *Server) shiftContext(seq *Sequence) {
 	seq.numPast -= numDiscard
 }
 
-func incompleteUnicode(token string) bool {
-	incomplete := false
-
-	// check if there is incomplete UTF-8 character at the end
-	for i := 1; i < 5 && i <= len(token); i++ {
-		c := token[len(token)-i]
-
-		if (c & 0xc0) == 0x80 {
-			// continuation byte: 10xxxxxx
-			continue
-		}
-
-		if (c & 0xe0) == 0xc0 {
-			// 2-byte character: 110xxxxx ...
-			incomplete = i < 2
-		} else if (c & 0xf0) == 0xe0 {
-			// 3-byte character: 1110xxxx ...
-			incomplete = i < 3
-		} else if (c & 0xf8) == 0xf0 {
-			// 4-byte character: 11110xxx ...
-			incomplete = i < 4
-		}
-
-		// else 1-byte character or invalid byte
-		break
-	}
-
-	return incomplete
-}
-
 func flushPending(seq *Sequence) bool {
 	for _, p := range seq.pendingResponses {
 		select {
 		case seq.responses <- p:
 		case <-seq.quit:
+			seq.pendingResponses = []string{}
 			return false
 		}
 	}
 
+	seq.pendingResponses = []string{}
 	return true
 }
 
@@ -237,9 +294,7 @@ func (s *Server) removeSequence(seqIndex int, reason string) {
 	seq.doneReason = reason
 	close(seq.responses)
 	close(seq.embedding)
-	seq.pendingResponses = []string{}
-	seq.cache.inUse = false
-	seq.samplingCtx.Free()
+	seq.cache.InUse = false
 	s.seqs[seqIndex] = nil
 }
 
@@ -254,10 +309,14 @@ func (s *Server) run(ctx context.Context) {
 	}
 }
 
+// TODO (jmorganca): processBatch should be simplified, removing:
+// * sampling
+// * stop token checking
+// * metrics
+// these should instead be handled by the handlers
+// it should only be responsible for accepting tokens or embeddings and
+// processing batches as fast as possible
 func (s *Server) processBatch() {
-	batch := llama.NewBatch(s.batchSize*len(s.seqs), 0, len(s.seqs))
-	defer batch.Free()
-
 	s.mu.Lock()
 	for s.allNil() {
 		s.cond.Wait() // Wait until an item is added
@@ -265,49 +324,72 @@ func (s *Server) processBatch() {
 	defer s.mu.Unlock()
 
 	slog.Debug("Processing batch", "seqs", len(s.seqs))
+	var batch *llama.Batch
 
-	for i, seq := range s.seqs {
+	seqIdx := s.nextSeq - 1
+	for range s.seqs {
+		seqIdx = (seqIdx + 1) % len(s.seqs)
+		seq := s.seqs[seqIdx]
+
 		if seq == nil {
 			continue
 		}
 
 		// if past the num predict limit
 		if seq.numPredict > 0 && seq.numPredicted > seq.numPredict {
-			s.removeSequence(i, "limit")
+			s.removeSequence(seqIdx, "limit")
 			continue
 		}
 
-		if seq.numPast+len(seq.tokens) > s.cache.numCtx {
+		if seq.numPast+len(seq.inputs) > s.cache.numCtx {
 			s.shiftContext(seq)
 		}
 
-		if seq.startProcessingTime.IsZero() {
-			seq.startProcessingTime = time.Now()
-		}
+		var numInputsProcessed int
+		for i, input := range seq.inputs {
+			embedding := input.embed != nil
 
-		var numTokensProcessed int
-		for j, t := range seq.tokens {
-			// todo: make this n_batch
-			if j >= s.batchSize {
+			// If we don't currently have a batch, allocate one of the correct type and
+			// fill it up as much as possible across all sequences. If we encounter an
+			// input of the opppsite type, stop for that sequence but then pick up from
+			// there for the next batch, ensuring that we alternate types
+			if batch == nil {
+				numEmbed := 0
+				if embedding {
+					numEmbed = s.lc.Model().NEmbd()
+				}
+				batch = llama.NewBatch(s.batchSize*len(s.seqs), numEmbed, len(s.seqs))
+				defer batch.Free()
+			} else if embedding != batch.IsEmbedding() {
+				s.nextSeq = seqIdx
 				break
 			}
-			batch.Add(t, seq.numPast, []int{seq.cache.id}, numTokensProcessed+1 == len(seq.tokens))
+
+			// todo: make this n_batch
+			if i >= s.batchSize {
+				break
+			}
+
+			batch.Add(input.token, input.embed, seq.numPast, []int{seq.cache.Id}, numInputsProcessed+1 == len(seq.inputs))
 			seq.numPast++
-			numTokensProcessed++
+			numInputsProcessed++
 		}
-		seq.cache.tokens = append(seq.cache.tokens, seq.tokens[:numTokensProcessed]...)
-		seq.tokens = seq.tokens[numTokensProcessed:]
-		seq.iBatch = batch.NumTokens() - 1
+
+		if numInputsProcessed > 0 {
+			seq.cache.Inputs = append(seq.cache.Inputs, seq.inputs[:numInputsProcessed]...)
+			seq.inputs = seq.inputs[numInputsProcessed:]
+			seq.iBatch = batch.NumTokens() - 1
+		}
 	}
 
-	if batch.NumTokens() == 0 {
+	if batch == nil || batch.NumTokens() == 0 {
 		return
 	}
 
 	err := s.lc.Decode(batch)
 	if err != nil {
 		slog.Error("failed to decode batch", "error", err)
-		panic("Failed to decode")
+		return
 	}
 
 	for i, seq := range s.seqs {
@@ -316,30 +398,30 @@ func (s *Server) processBatch() {
 		}
 
 		// don't sample prompt processing
-		if len(seq.tokens) != 0 {
+		if len(seq.inputs) != 0 {
 			continue
+		}
+
+		seq.numDecoded += 1
+		if seq.numDecoded == 1 {
+			seq.startGenerationTime = time.Now()
 		}
 
 		// if done processing the prompt, generate an embedding and return
 		if seq.embeddingOnly {
-			embd := s.lc.GetEmbeddingsSeq(i)
-			if embd == nil {
-				embd = s.lc.GetEmbeddingsIth(seq.iBatch)
+			embed := s.lc.GetEmbeddingsSeq(i)
+			if embed == nil {
+				embed = s.lc.GetEmbeddingsIth(seq.iBatch)
 			}
 
-			seq.embedding <- embd
+			seq.embedding <- embed
 			s.removeSequence(i, "")
 			continue
 		}
 
 		// sample a token
 		token := seq.samplingCtx.Sample(s.lc, nil, seq.iBatch)
-
 		seq.samplingCtx.Accept(s.lc, token, true)
-		seq.numDecoded += 1
-		if seq.numDecoded == 1 {
-			seq.startGenerationTime = time.Now()
-		}
 		piece := s.model.TokenToPiece(token)
 
 		seq.numPredicted++
@@ -356,7 +438,7 @@ func (s *Server) processBatch() {
 			continue
 		}
 
-		seq.tokens = []int{token}
+		seq.inputs = []input{{token: token}}
 
 		seq.pendingResponses = append(seq.pendingResponses, piece)
 		sequence := strings.Join(seq.pendingResponses, "")
@@ -364,7 +446,12 @@ func (s *Server) processBatch() {
 		if ok, stop := findStop(sequence, seq.stop); ok {
 			slog.Info("hit stop token", "stop", seq.stop)
 
+			trimCacheLen := len(seq.pendingResponses) - 1
 			seq.pendingResponses = truncateStop(seq.pendingResponses, stop)
+			trimCacheLen -= len(seq.pendingResponses)
+
+			// remove any tokens from the cache that we don't actually return
+			seq.cache.Inputs = seq.cache.Inputs[:len(seq.cache.Inputs)-trimCacheLen]
 			s.removeSequence(i, "stop")
 			continue
 		}
@@ -378,13 +465,14 @@ func (s *Server) processBatch() {
 		}
 
 		if !flushPending(seq) {
-			seq.pendingResponses = []string{}
 			s.removeSequence(i, "connection")
 		}
-		seq.pendingResponses = []string{}
 	}
 }
 
+// TODO (jmorganca): use structs from the api package to avoid duplication
+// this way the api acts as a proxy instead of using a different api for the
+// runner
 type Options struct {
 	api.Runner
 
@@ -408,10 +496,15 @@ type Options struct {
 	Stop             []string `json:"stop"`
 }
 
+type ImageData struct {
+	Data []byte `json:"data"`
+	ID   int    `json:"id"`
+}
+
 type CompletionRequest struct {
-	Prompt  string   `json:"prompt"`
-	Images  []string `json:"images"`
-	Grammar string   `json:"grammar"`
+	Prompt  string      `json:"prompt"`
+	Images  []ImageData `json:"image_data"`
+	Grammar string      `json:"grammar"`
 
 	Options
 }
@@ -449,7 +542,12 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	// Set the headers to indicate streaming
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Transfer-Encoding", "chunked")
-	w.WriteHeader(http.StatusOK)
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
 
 	var samplingParams llama.SamplingParams
 	samplingParams.TopK = req.TopK
@@ -469,20 +567,29 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	samplingParams.Seed = uint32(req.Seed)
 	samplingParams.Grammar = req.Grammar
 
-	seq := s.NewSequence(req.Prompt, NewSequenceParams{
+	seq, err := s.NewSequence(req.Prompt, req.Images, NewSequenceParams{
 		numPredict:     req.NumPredict,
 		stop:           req.Stop,
 		numKeep:        req.NumKeep,
 		samplingParams: &samplingParams,
 		embedding:      false,
 	})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create new sequence: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// TODO (jmorganca): add to sequence queue instead of
 	// failing if a slot isn't available
 	s.mu.Lock()
 	for i, sq := range s.seqs {
 		if sq == nil {
-			seq.cache, seq.tokens, seq.numPast = s.cache.LoadCacheSlot(seq.tokens)
+			seq.cache, seq.inputs, seq.numPast, err = s.cache.LoadCacheSlot(seq.inputs)
+			if err != nil {
+				s.mu.Unlock()
+				http.Error(w, fmt.Sprintf("Failed to load cache: %v", err), http.StatusInternalServerError)
+				return
+			}
 			s.seqs[i] = seq
 			s.cond.Signal()
 			break
@@ -490,48 +597,41 @@ func (s *Server) completion(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Unlock()
 
-	// stream the response
-	for content := range seq.responses {
-		if err := json.NewEncoder(w).Encode(&CompletionResponse{
-			Content: content,
-		}); err != nil {
-			log.Println("Failed to encode result:", err)
+	for {
+		select {
+		case <-r.Context().Done():
 			close(seq.quit)
 			return
+		case content, ok := <-seq.responses:
+			if ok {
+				if err := json.NewEncoder(w).Encode(&CompletionResponse{
+					Content: content,
+				}); err != nil {
+					http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
+					close(seq.quit)
+					return
+				}
+
+				flusher.Flush()
+			} else {
+				// Send the final response
+				if err := json.NewEncoder(w).Encode(&CompletionResponse{
+					Stop:         true,
+					StoppedLimit: seq.doneReason == "limit",
+					Timings: Timings{
+						PromptN:     seq.numPromptInputs,
+						PromptMS:    float64(seq.startGenerationTime.Sub(seq.startProcessingTime).Milliseconds()),
+						PredictedN:  seq.numDecoded,
+						PredictedMS: float64(time.Since(seq.startGenerationTime).Milliseconds()),
+					},
+				}); err != nil {
+					http.Error(w, fmt.Sprintf("failed to encode final response: %v", err), http.StatusInternalServerError)
+				}
+
+				return
+			}
 		}
-
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-			close(seq.quit)
-			return
-		}
-
-		flusher.Flush()
 	}
-
-	// Send the stop
-	if err := json.NewEncoder(w).Encode(&CompletionResponse{
-		Stop:         true,
-		StoppedLimit: seq.doneReason == "limit",
-		Timings: Timings{
-			PromptN:     seq.numPromptTokens,
-			PromptMS:    float64(seq.startGenerationTime.Sub(seq.startProcessingTime).Milliseconds()),
-			PredictedN:  seq.numDecoded,
-			PredictedMS: float64(time.Since(seq.startGenerationTime).Milliseconds()),
-		},
-	}); err != nil {
-		log.Println("Failed to encode result:", err)
-		return
-	}
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
-		return
-	}
-
-	flusher.Flush()
 }
 
 type EmbeddingRequest struct {
@@ -545,7 +645,7 @@ type EmbeddingResponse struct {
 func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	var req EmbeddingRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Bad request", http.StatusBadRequest)
+		http.Error(w, fmt.Sprintf("bad request: %s", err), http.StatusBadRequest)
 		return
 	}
 
@@ -553,13 +653,22 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 
 	slog.Debug("embedding request", "content", req.Content)
 
-	seq := s.NewSequence(req.Content, NewSequenceParams{embedding: true})
+	seq, err := s.NewSequence(req.Content, nil, NewSequenceParams{embedding: true})
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to create new sequence: %v", err), http.StatusInternalServerError)
+		return
+	}
 
 	// TODO (jessegross): Wait for a free slot instead of failing and blocking forever
 	s.mu.Lock()
 	for i, sq := range s.seqs {
 		if sq == nil {
-			seq.cache, seq.tokens, seq.numPast = s.cache.LoadCacheSlot(seq.tokens)
+			seq.cache, seq.inputs, seq.numPast, err = s.cache.LoadCacheSlot(seq.inputs)
+			if err != nil {
+				s.mu.Unlock()
+				http.Error(w, fmt.Sprintf("Failed to load cache: %v", err), http.StatusInternalServerError)
+				return
+			}
 			s.seqs[i] = seq
 			s.cond.Signal()
 			break
@@ -572,8 +681,7 @@ func (s *Server) embeddings(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(&EmbeddingResponse{
 		Embedding: embedding,
 	}); err != nil {
-		log.Println("Failed to encode result:", err)
-		return
+		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 	}
 }
 
@@ -607,8 +715,7 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		Status:   s.status.ToString(),
 		Progress: s.progress,
 	}); err != nil {
-		log.Println("Failed to encode result:", err)
-		return
+		http.Error(w, fmt.Sprintf("failed to encode response: %v", err), http.StatusInternalServerError)
 	}
 }
 
@@ -625,7 +732,7 @@ func (s *Server) loadModel(
 
 	s.model = llama.LoadModelFromFile(mpath, params)
 
-	ctxParams := llama.NewContextParams(kvSize, s.batchSize, s.parallel, threads, flashAttention)
+	ctxParams := llama.NewContextParams(kvSize, s.batchSize*s.parallel, s.parallel, threads, flashAttention)
 	s.lc = llama.NewContextWithModel(s.model, ctxParams)
 
 	if lpath != "" {
@@ -640,12 +747,10 @@ func (s *Server) loadModel(
 	}
 
 	if ppath != "" {
-		s.cc = llama.NewClipContext(ppath)
-		// TODO (jessegross): Vision model support
-		panic("Vision models are not yet supported")
+		s.clip.cc = llama.NewClipContext(ppath)
 	}
 
-	s.cache = NewTokenCache(s.lc, kvSize, s.parallel)
+	s.cache = NewInputCache(s.lc, kvSize, s.parallel)
 
 	s.status = ServerStatusReady
 	s.ready.Done()
