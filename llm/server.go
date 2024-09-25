@@ -187,11 +187,12 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		"--batch-size", strconv.Itoa(opts.NumBatch),
 		"--embedding",
 	}
+	gpuParams := []string{}
 
 	params = append(params, "--log-disable")
 
 	if opts.NumGPU >= 0 {
-		params = append(params, "--n-gpu-layers", strconv.Itoa(opts.NumGPU))
+		gpuParams = append(gpuParams, "--n-gpu-layers", strconv.Itoa(opts.NumGPU))
 	}
 
 	if envconfig.Debug() {
@@ -199,7 +200,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 	}
 
 	if opts.MainGPU > 0 {
-		params = append(params, "--main-gpu", strconv.Itoa(opts.MainGPU))
+		gpuParams = append(gpuParams, "--main-gpu", strconv.Itoa(opts.MainGPU))
 	}
 
 	if len(adapters) > 0 {
@@ -238,7 +239,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 	}
 
 	if flashAttnEnabled {
-		params = append(params, "--flash-attn")
+		gpuParams = append(gpuParams, "--flash-attn")
 	}
 
 	// Windows CUDA should not use mmap for best performance
@@ -268,7 +269,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 	params = append(params, "--parallel", strconv.Itoa(numParallel))
 
 	if estimate.TensorSplit != "" {
-		params = append(params, "--tensor-split", estimate.TensorSplit)
+		gpuParams = append(gpuParams, "--tensor-split", estimate.TensorSplit)
 	}
 
 	for i := range servers {
@@ -278,10 +279,6 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			finalErr = fmt.Errorf("[%d] server %s not listed in available servers %v", i, servers[i], availableServers)
 			slog.Error("server list inconsistent", "error", finalErr)
 			continue
-		}
-
-		if strings.HasPrefix(servers[i], "cpu") {
-			gpus = gpu.GetCPUInfo()
 		}
 
 		// Find an availableServers  port, retry on each iteration in case the failure was a port conflict race
@@ -298,6 +295,11 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			port = rand.Intn(65535-49152) + 49152 // get a random port in the ephemeral range
 		}
 		finalParams := append(params, "--port", strconv.Itoa(port))
+		if strings.HasPrefix(servers[i], "cpu") {
+			gpus = gpu.GetCPUInfo()
+		} else {
+			finalParams = append(finalParams, gpuParams...)
+		}
 
 		pathEnv := "LD_LIBRARY_PATH"
 		if runtime.GOOS == "windows" {
@@ -409,6 +411,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			// Detect permission denied and augment the message about noexec
 			if errors.Is(err, os.ErrPermission) {
 				finalErr = fmt.Errorf("unable to start server %w.  %s may have noexec set.  Set OLLAMA_TMPDIR for server to a writable executable directory", err, dir)
+				slog.Warn("failed to start llama server", "server", server, "error", finalErr)
 				continue
 			}
 			msg := ""
@@ -417,6 +420,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			}
 			err = fmt.Errorf("error starting the external llama server: %v %s", err, msg)
 			finalErr = err
+			slog.Warn("failed to start llama server", "server", server, "error", finalErr)
 			continue
 		}
 
