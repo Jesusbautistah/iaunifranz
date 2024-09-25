@@ -213,6 +213,16 @@ jobs:
         env:
           OLLAMA_SKIP_CPU_GENERATE: '1'
 
+  validate-openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: stoplightio/spectral-action@latest
+        with:
+          file_glob: 'specs/*.yaml'
+
   lint:
     strategy:
       matrix:
